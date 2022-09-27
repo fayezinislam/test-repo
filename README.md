@@ -24,7 +24,7 @@ In this tutorial, you establish a working example of an exchange data architectu
 This document assumes that you’re familiar with high-performance exchange binary data feeds, Terraform, Cloud Storage, and BigQuery.
 ------
 ## Objectives
-* Deploy prerequisite infrastructure to your GCP project using Terraform
+* Deploy schema-driven infrastructure to your GCP project using Terraform
 * Illustrate the ingestion of binary market data into BigQuery using the transcoder
 * Author views that simplify analytics against the dataset in BigQuery 
 ----
@@ -68,10 +68,16 @@ See [Clean up](#clean-up) for more detail.
    ```
 5. Install Terraform. To learn how to do this installation, see the [HashiCorp documentation](https://learn.hashicorp.com/tutorials/terraform/install-cli#install-terraform).
 6. [Verify](https://learn.hashicorp.com/tutorials/terraform/install-cli#verify-the-installation) the installation
-9. Initialize the environment variables: 
-    ```
-    cd datacast/pipelines && source environment-variables.sh
-    ```
+9. Run the setup script.
+     ```
+     pushd pipelines/common_components
+     ./setup_script.sh
+     popd
+     ```
+    
+    This will create a `backend.tf` and `terraform.tfvars` files based on the templates.
+    If you wish to create a composer infrastructure, manually amand the`terraform.tfvars` so that it 
+has `enable_composer=true`
 10. Run the setup script.
      ```
      cd common_components && ./setup_script.sh
@@ -82,59 +88,56 @@ See [Clean up](#clean-up) for more detail.
 has `enable_composer=true`
 11. Run terraform to create the required infrastructure
      ```
-     cd orchestration/infrastructure/
+     pushd pipelines/common_components/orchestration/infrastructure/
      terraform init -upgrade
      terraform plan
      terraform apply
+     popd
      ```
     If you enabled Composer at the step before, you will see a URL for the airflow ui. Click on the link to verify 
     the installation.
 13. In the Google Cloud Console, go to the **Cloud Storage** page and check for a bucket with a name like 
 `${project}-${region}-ingest-bucket` to verify that an ingest bucket has been created.
 14. Go to the **BigQuery** page and verify that the following datasets have been created:
-     * asx_dev
-     * asx_sample_data
+     * cme_dev
+     * cme_sample_data
 ----
 ## Transcode and upload the sample data
 In this section, you explore the sample input file, and run the Market Data Transcoder to load transcoded sample data 
 to BigQuery. 
 1. In the Cloud Shell Editor instance, inspect the input file by running the following commands:
-<!-- WILL UPDATE WITH DATA SOURCE ONCE PCAPs ARE READY -->
-    <!-- ```
-    ing_bk=`gsutil ls | grep ingest-bucket`
-    pub_bk="gs://reg-rpt-pattern-matait-dev-us-ingest-bucket/asx/"
+    ```
+    pushd pipelines/common_components/orchestration/infrastructure
+    INGEST_BUCKET=`terraform output -raw ingest_gcs_bucket`
+    popd
+    SOURCE_BUCKET="gs://marketdata-public/wfic/"
     
-    cd ../../../../pipelines/asx/ 
-    gsutil cp ${pub_bk}NTP_220306_1646551229.log input_data/NTP_220306_1646551229.log
-    head -c 1000 input_data/NTP_220306_1646551229.log
-    ``` -->
+    pushd pipelines/cme/ 
+    gsutil cp ${SOURCE_BUCKET}cme.incr.b64l input_data/cme.incr.b64l
+    head -c 1000 input_data/cme.incr.b64l
+    popd
+    ```
     The commands print the input file's first 1000 bytes to Cloud Shell's standard output. Notice that some of the file's characters are non-ASCII
 because the file is in binary rather than text format.
 2. Open, and inspect, the /source folder. It contains an application which accepts command-line arguments. 
 The class parses dynamic length binary messages in a binary format file and decodes them into input formats 
 accepted by BigQuery and PubSub, according to a specified schema. More details are available in the Market 
 Data Transcoders's [documentation](../README.md).
-3. Run the Transcoder to load the file's decoded contents into Avro Files and then BigQuery:
+3. Run the Transcoder, passing a schema file as input, to generate an Avro schema file. Note, no binary message file is passed in this step; therefore no messages are decoded or published.
     ```
-    cd ../../
-    
     python3 -m venv env && source env/bin/activate
     pip3 install -r requirements.txt
-    python3 main.py -source_file cme/cme.incr.b64l -schema_file cme/schemas/templates_FixBinary_v12.xml --base64 -factory cme -source_file_format_type line_delimited -output_path=cme_avroOut 
+    python3 main.py -factory=cme -schema_file pipelines/cme/schemas/templates_FixBinary_v12.xml -source_file /dev/null -source_file_format_type length_delimited --continue_on_error -destination_project_id ${PROJECT_ID} 
     ```
-    The data has now been decoded and persisted to Avro. 
+    For each message type in the the schema file passed to the Transcoder, the Transcoder has generated a corresponding Avro schema file. These will be used to create one Pub/Sub topic for each message type. 
 ----
 ## Create Streaming Pipeline via Dataflow
 In this section we will create a streaming pipeline via Cloud Dataflow to load the data into the BigQuery sink.
-1. In the Cloud Shell instance, use the following commands. Enable services:
+1. Copy Avro Schema File into GCS Bucket
     ```
-    gcloud services enable dataflow.googleapis.com
- 4   ```
-2. Copy Avro Schema File into GCS Bucket
+    gsutil cp avroOut/null-MDIncrementalRefreshBook46.avsc gs://${INGEST_BUCKET}
     ```
-    gsutil cp cme_avroOut/cme.incr-MDIncrementalRefreshBook46.avsc gs://${PROJECT_ID}-eu-ingest-bucket
-    ```
-3. Create Topic
+3. Create Topics
     ```
     gcloud pubsub topics create MDIncrementalRefreshBook46
     gcloud pubsub topics create dead-letter
@@ -164,7 +167,7 @@ schemaPath=gs://${PROJECT_ID}-eu-ingest-bucket/cme.incr-MDIncrementalRefreshBook
 inputSubscription=projects/${PROJECT_ID}/subscriptions/refreshbook-subscription,\
 outputTableSpec=${PROJECT_ID}:cme_bq_dev.refresh_book_streamed ,\
 outputTopic=projects/${PROJECT_ID}/topics/dead-letter -->
-gcloud dataflow jobs run ps-to-avro-MDIncrementalRefreshBook46 --gcs-location gs://dataflow-templates-us-central1/latest/Cloud_PubSub_to_Avro --region us-central1 --staging-location gs://wfic-lab-harry-eu-dataflow-bucket/temp/ --parameters inputTopic=projects/wfic-lab-harry/topics/MDIncrementalRefreshBook46,outputDirectory=gs://wfic-lab-harry-eu-dataflow-bucket,avroTempDirectory=gs://wfic-lab-harry-eu-dataflow-bucket/temp/ --disable-public-ips --additional-experiments=enable_secure_boot 
+gcloud dataflow jobs run ps-to-avro-MDIncrementalRefreshBook46 --gcs-location gs://dataflow-templates-us-central1/latest/Cloud_PubSub_to_Avro --region ${REGION} --staging-location gs://${DATAFLOW_BUCKET}/temp/ --parameters inputTopic=projects/${PROJECT_ID}/topics/MDIncrementalRefreshBook46,outputDirectory=${DATAFLOW_BUCKET},avroTempDirectory=${DATAFLOW_BUCKET}/temp/ --disable-public-ips --additional-experiments=enable_secure_boot 
     ```
 6. Run the Transcoder to publish and stream the file's decoded contents into Pub/Sub:
     ```
